@@ -34,6 +34,7 @@ const COURSE_NAME = opt('--course', '');
 const CLASS_NAME = opt('--class', '');
 const MIN = Number(opt('--min', 90));
 const MAX = Number(opt('--max', 100));
+const SCORES = (opt('--scores', '') || '').split(',').map(s => Number(s.trim())).filter(n => !isNaN(n) && n > 0);
 const WORKERS = Number(opt('--workers', 4));
 const WORK_ID = opt('--work', '');
 const LIST_ONLY = has('--list-only');
@@ -47,7 +48,7 @@ if (!COURSE_NAME) { console.error('需要 --course "课程名"'); process.exit(1
 
 const ts = () => new Date().toISOString().slice(11, 19);
 const log = (...a) => console.log(ts(), ...a);
-const rnd = () => MIN + Math.floor(Math.random() * (MAX - MIN + 1));
+const rnd = () => SCORES.length ? SCORES[Math.floor(Math.random() * SCORES.length)] : MIN + Math.floor(Math.random() * (MAX - MIN + 1));
 
 /* ---------------- 浏览器 ---------------- */
 async function launch() {
@@ -90,11 +91,12 @@ async function resolveCourse(page, name) {
   await page.goto(hit, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(6000);
   const u = new URL(page.url());
+  const pick = (...ks) => { for (const k of ks) { const v = u.searchParams.get(k); if (v) return v; } return null; };
   return {
     url: page.url(),
-    courseid: u.searchParams.get('courseid'),
-    clazzid: u.searchParams.get('clazzid'),
-    enc: u.searchParams.get('enc'),
+    courseid: pick('courseid', 'courseId'),
+    clazzid: pick('clazzid', 'clazzId'),
+    enc: pick('enc'),
   };
 }
 
@@ -111,23 +113,23 @@ async function readCards(frame) {
   }));
 }
 
-async function collectWorks(page, courseUrl, className) {
-  await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(7000);
-  let frame = page.frames().find(f => f.url().includes('work/list'));
-  if (!frame) {
-    await page.getByText('\u4f5c\u4e1a', { exact: true }).first().click({ timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(6000);
-    frame = page.frames().find(f => f.url().includes('work/list'));
+async function collectWorks(page, course, className) {
+  // 直接打开作业列表页（新版界面已停用旧课程页，但该列表页仍可直连）
+  const wl = `https://mooc2-ans.chaoxing.com/mooc2-ans/work/list?courseid=${course.courseid}&clazzid=${course.clazzid}&courseId=${course.courseid}&classId=${course.clazzid}&clazzId=${course.clazzid}&cpi=486951922&pageHeader=6&v=2`;
+  await page.goto(wl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(6000);
+  const frame = page;
+  if (!(await page.evaluate(() => document.querySelectorAll('li[id^=work]').length))) {
+    throw new Error('作业列表未加载（可能是登录态失效，请重试）');
   }
-  if (!frame) throw new Error('未找到作业列表 iframe');
 
   const classes = await frame.evaluate(() => [...document.querySelectorAll('li.classli')].map(e => (e.innerText || '').trim()));
   const pick = className || classes.find(c => c !== '\u5168\u90e8\u73ed\u7ea7');
   if (className && !classes.includes(className)) throw new Error('班级不存在。可选：' + classes.join(' / '));
-  await frame.evaluate(n => {
+  const classId = await frame.evaluate(n => {
     const li = [...document.querySelectorAll('li.classli')].find(e => (e.innerText || '').trim() === n);
-    if (li) li.click();
+    if (li) { li.click(); return li.getAttribute('data'); }
+    return null;
   }, pick);
   await page.waitForTimeout(4500);
 
@@ -145,7 +147,7 @@ async function collectWorks(page, courseUrl, className) {
     if (!moved || added === 0) break;
     await page.waitForTimeout(4000);
   }
-  return { frame, works: all, className: pick };
+  return { frame, works: all, className: pick, classId };
 }
 
 /* ---------------- 单个作业 ---------------- */
@@ -153,16 +155,28 @@ const reviewUrl = (c, w, id) => `https://mooc2-ans.chaoxing.com/mooc2-ans/work/l
 const listUrl = (c, w) => `https://mooc2-ans.chaoxing.com/mooc2-ans/work/mark?courseid=${c.courseid}&clazzid=${c.clazzid}&id=${w}&cpi=486951922&evaluation=0&from=&v=0&prePageNum=1&prePageSize=20&topicid=0&perspectiveType=0`;
 
 async function answerIds(page, c, work) {
-  await page.goto(listUrl(c, work), { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(1800);
-  const first = await page.evaluate(() => {
-    const a = document.querySelector('a.cz_py');
-    const m = a && (a.getAttribute('data') || '').match(/workAnswerId=(\d+)/);
-    return m ? m[1] : null;
-  });
-  if (!first) return [];
+  let first = null;
+  for (let attempt = 0; attempt < 2 && !first; attempt++) {
+    await page.goto(listUrl(c, work), { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(2500);
+    await page.waitForSelector('a.cz_py', { timeout: 15000 }).catch(() => {});
+    first = await page.evaluate(() => {
+      const a = document.querySelector('a.cz_py');
+      const m = a && (a.getAttribute('data') || '').match(/workAnswerId=(\d+)/);
+      return m ? m[1] : null;
+    });
+  }
+  if (!first) {
+    const diag = await page.evaluate(() => ({
+      url: location.href.slice(0, 120),
+      body: document.body.innerText.replace(/\s+/g, ' ').slice(0, 120),
+      rows: document.querySelectorAll('ul.dataBody_td').length,
+    })).catch(() => ({}));
+    log('  [diag] 列表页无批阅链接:', JSON.stringify(diag));
+    return [];
+  }
   await page.goto(reviewUrl(c, work, first), { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(2200);
   return JSON.parse((await page.locator('#viewAnswerIds').inputValue().catch(() => '[]')) || '[]');
 }
 
@@ -248,8 +262,9 @@ async function gradeOne(page, c, work, id) {
 
   const course = await resolveCourse(seed, COURSE_NAME);
   log('课程:', COURSE_NAME, '| courseid=' + course.courseid, 'clazzid=' + course.clazzid);
-  const { works, className } = await collectWorks(seed, course.url, CLASS_NAME);
-  log('班级:', className, '| 作业数:', works.length);
+  const { works, className, classId } = await collectWorks(seed, course, CLASS_NAME);
+  if (classId) course.clazzid = classId;   // 后续批阅页必须用所选班级的 id
+  log('班级:', className, '| clazzid=' + course.clazzid, '| 作业数:', works.length);
 
   const targets = WORK_ID
     ? works.filter(w => w.workId === WORK_ID)
